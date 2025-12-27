@@ -1,4 +1,5 @@
 use clap::Parser;
+use colored::Colorize;
 use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::{Client, Version};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,13 +71,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data: Option<Arc<str>> = args.data.map(|s| s.into());
 
     println!(
-        "Benchmarking {} ({}) with {} connections x {} streams = {} concurrency, {} total requests",
-        url,
-        protocol,
-        args.connections,
-        args.pipeline,
-        args.connections * args.pipeline,
-        args.requests
+        "{} {} ({}) with {} connections x {} streams = {} concurrency, {} total requests",
+        "Benchmarking".cyan().bold(),
+        url.yellow(),
+        protocol.magenta(),
+        args.connections.to_string().green(),
+        args.pipeline.to_string().green(),
+        (args.connections * args.pipeline).to_string().green().bold(),
+        args.requests.to_string().green()
     );
 
     let start = Instant::now();
@@ -149,16 +151,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Duration::ZERO
     };
 
-    println!("\n--- Results ---");
-    println!("Total time:    {:?}", total_time);
-    println!("Requests/sec:  {:.2}", args.requests as f64 / total_time.as_secs_f64());
-    println!("Success:       {}", success);
-    println!("Failed:        {}", failed);
-    println!("\n--- Latency ---");
-    println!("Avg:           {:?}", avg);
-    println!("P50:           {:?}", p50);
-    println!("P95:           {:?}", p95);
-    println!("P99:           {:?}", p99);
+    let rps = args.requests as f64 / total_time.as_secs_f64();
+
+    println!("\n{}", "--- Results ---".cyan().bold());
+    println!("{:<14} {:?}", "Total time:".white(), total_time);
+    println!("{:<14} {}", "Requests/sec:".white(), format!("{:.2}", rps).green().bold());
+    println!("{:<14} {}", "Success:".white(), success.to_string().green());
+    if failed > 0 {
+        println!("{:<14} {}", "Failed:".white(), failed.to_string().red().bold());
+    } else {
+        println!("{:<14} {}", "Failed:".white(), "0".dimmed());
+    }
+
+    println!("\n{}", "--- Latency ---".cyan().bold());
+    println!("{:<14} {:?}", "Avg:".white(), avg);
+    println!("{:<14} {:?}", "P50:".white(), p50);
+    println!("{:<14} {}", "P95:".white(), format!("{:?}", p95).yellow());
+    println!("{:<14} {}", "P99:".white(), format!("{:?}", p99).red());
 
     Ok(())
 }
@@ -184,7 +193,12 @@ async fn send_request(
     match result {
         Ok(resp) => {
             if resp.version() != expected_version {
-                eprintln!("Warning: {:?} not {:?}", resp.version(), expected_version);
+                eprintln!(
+                    "{} {:?} not {:?}",
+                    "Warning:".yellow(),
+                    resp.version(),
+                    expected_version
+                );
             }
             if resp.status().is_success() {
                 stats.success.fetch_add(1, Ordering::Relaxed);
