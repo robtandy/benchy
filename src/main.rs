@@ -30,6 +30,10 @@ struct Args {
     #[arg(long = "h3")]
     http3: bool,
 
+    /// Skip TLS certificate verification
+    #[arg(short = 'k', long = "insecure")]
+    insecure: bool,
+
     /// Target URL
     url: String,
 }
@@ -39,7 +43,7 @@ struct Stats {
     failed: AtomicU64,
 }
 
-fn build_client(http3: bool) -> Result<Client, reqwest::Error> {
+fn build_client(http3: bool, insecure: bool) -> Result<Client, reqwest::Error> {
     let mut builder = Client::builder()
         .pool_max_idle_per_host(1)
         .pool_idle_timeout(Duration::from_secs(30));
@@ -48,6 +52,10 @@ fn build_client(http3: bool) -> Result<Client, reqwest::Error> {
         builder = builder.http3_prior_knowledge();
     } else {
         builder = builder.http2_prior_knowledge();
+    }
+
+    if insecure {
+        builder = builder.danger_accept_invalid_certs(true);
     }
 
     builder.build()
@@ -89,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut handles = Vec::with_capacity(args.connections);
 
     for i in 0..args.connections {
-        let client = build_client(args.http3)?;
+        let client = build_client(args.http3, args.insecure)?;
 
         let url = url.clone();
         let data = data.clone();
