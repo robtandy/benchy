@@ -183,9 +183,14 @@ async fn send_request(
     let req_start = Instant::now();
 
     let result = if let Some(ref body) = data {
-        client.post(url).body(body.to_string()).send().await
+        client
+            .post(url)
+            .version(expected_version)
+            .body(body.to_string())
+            .send()
+            .await
     } else {
-        client.get(url).send().await
+        client.get(url).version(expected_version).send().await
     };
 
     let elapsed = req_start.elapsed();
