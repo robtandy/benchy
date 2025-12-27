@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 #[derive(Parser)]
-#[command(name = "benchy", about = "HTTP/2 benchmark tool")]
+#[command(name = "benchy", about = "HTTP/2 and HTTP/3 benchmark tool")]
 struct Args {
-    /// Number of concurrent connections (separate TCP connections)
+    /// Number of concurrent connections
     #[arg(short = 'c', default_value = "10")]
     connections: usize,
 
@@ -21,9 +21,13 @@ struct Args {
     #[arg(short = 'd')]
     data: Option<String>,
 
-    /// Pipelining depth per connection (concurrent HTTP/2 streams)
+    /// Pipelining depth per connection (concurrent streams)
     #[arg(short = 'p', default_value = "10")]
     pipeline: usize,
+
+    /// Use HTTP/3 (QUIC) instead of HTTP/2
+    #[arg(long = "h3")]
+    http3: bool,
 
     /// Target URL
     url: String,
@@ -34,9 +38,26 @@ struct Stats {
     failed: AtomicU64,
 }
 
+fn build_client(http3: bool) -> Result<Client, reqwest::Error> {
+    let mut builder = Client::builder()
+        .pool_max_idle_per_host(1)
+        .pool_idle_timeout(Duration::from_secs(30));
+
+    if http3 {
+        builder = builder.http3_prior_knowledge();
+    } else {
+        builder = builder.http2_prior_knowledge();
+    }
+
+    builder.build()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    let protocol = if args.http3 { "HTTP/3" } else { "HTTP/2" };
+    let expected_version = if args.http3 { Version::HTTP_3 } else { Version::HTTP_2 };
 
     let stats = Arc::new(Stats {
         success: AtomicU64::new(0),
@@ -49,8 +70,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data: Option<Arc<str>> = args.data.map(|s| s.into());
 
     println!(
-        "Benchmarking {} with {} connections x {} streams = {} concurrency, {} total requests",
+        "Benchmarking {} ({}) with {} connections x {} streams = {} concurrency, {} total requests",
         url,
+        protocol,
         args.connections,
         args.pipeline,
         args.connections * args.pipeline,
@@ -65,12 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut handles = Vec::with_capacity(args.connections);
 
     for i in 0..args.connections {
-        // Each worker gets its own Client = its own TCP connection
-        let client = Client::builder()
-            .http2_prior_knowledge()
-            .pool_max_idle_per_host(1)
-            .pool_idle_timeout(Duration::from_secs(30))
-            .build()?;
+        let client = build_client(args.http3)?;
 
         let url = url.clone();
         let data = data.clone();
@@ -84,18 +101,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut in_flight = FuturesUnordered::new();
             let mut sent = 0u64;
 
-            // Seed the pipeline
             while sent < my_reqs && in_flight.len() < pipeline {
-                in_flight.push(send_request(&client, &url, &data, &stats));
+                in_flight.push(send_request(&client, &url, &data, &stats, expected_version));
                 sent += 1;
             }
 
-            // Process completions and refill pipeline
             while let Some(elapsed) = in_flight.next().await {
                 let _ = tx.send(elapsed);
 
                 if sent < my_reqs {
-                    in_flight.push(send_request(&client, &url, &data, &stats));
+                    in_flight.push(send_request(&client, &url, &data, &stats, expected_version));
                     sent += 1;
                 }
             }
@@ -154,6 +169,7 @@ async fn send_request(
     url: &str,
     data: &Option<Arc<str>>,
     stats: &Stats,
+    expected_version: Version,
 ) -> Duration {
     let req_start = Instant::now();
 
@@ -167,8 +183,8 @@ async fn send_request(
 
     match result {
         Ok(resp) => {
-            if resp.version() != Version::HTTP_2 {
-                eprintln!("Warning: {:?} not HTTP/2", resp.version());
+            if resp.version() != expected_version {
+                eprintln!("Warning: {:?} not {:?}", resp.version(), expected_version);
             }
             if resp.status().is_success() {
                 stats.success.fetch_add(1, Ordering::Relaxed);

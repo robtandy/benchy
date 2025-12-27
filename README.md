@@ -1,11 +1,12 @@
 # benchy
 
-Fast HTTP/2 benchmark tool with connection multiplexing and stream pipelining.
+Fast HTTP/2 and HTTP/3 benchmark tool with connection multiplexing and stream pipelining.
 
 ## Features
 
-- **Multiple TCP connections** - Force separate connections instead of relying on pool heuristics
-- **HTTP/2 stream pipelining** - Multiple concurrent streams per connection
+- **HTTP/2 and HTTP/3 support** - Benchmark both protocols with `--h3` flag
+- **Multiple connections** - Force separate connections instead of relying on pool heuristics
+- **Stream pipelining** - Multiple concurrent streams per connection
 - **Low overhead** - Lock-free stats, channel-based latency collection
 - **Latency percentiles** - p50, p95, p99, and average
 
@@ -32,19 +33,23 @@ benchy [OPTIONS] <URL>
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-c` | Number of TCP connections | 10 |
-| `-p` | HTTP/2 streams per connection (pipeline depth) | 10 |
+| `-c` | Number of connections | 10 |
+| `-p` | Streams per connection (pipeline depth) | 10 |
 | `-n` | Total number of requests | 100 |
 | `-d` | POST body data | None (GET) |
+| `--h3` | Use HTTP/3 (QUIC) instead of HTTP/2 | false |
 
 ### Examples
 
 ```bash
-# Basic: 10 connections × 10 streams = 100 concurrent requests
+# HTTP/2: 10 connections × 10 streams = 100 concurrent requests
 benchy -n 10000 http://localhost:8080
 
-# High throughput: 20 connections × 50 streams = 1000 concurrent requests
+# HTTP/2 high throughput: 20 connections × 50 streams = 1000 concurrent requests
 benchy -c 20 -p 50 -n 100000 http://localhost:8080
+
+# HTTP/3 (QUIC)
+benchy --h3 -c 10 -p 50 -n 10000 https://localhost:8443
 
 # POST with body
 benchy -c 10 -p 20 -n 5000 -d '{"key":"value"}' http://localhost:8080/api
@@ -53,7 +58,7 @@ benchy -c 10 -p 20 -n 5000 -d '{"key":"value"}' http://localhost:8080/api
 ### Output
 
 ```
-Benchmarking http://localhost:8080 with 10 connections x 10 streams = 100 concurrency, 10000 total requests
+Benchmarking http://localhost:8080 (HTTP/2) with 10 connections x 10 streams = 100 concurrency, 10000 total requests
 
 --- Results ---
 Total time:    1.234567s
@@ -70,9 +75,9 @@ P99:           25.789ms
 
 ## Notes
 
-- Uses `http2_prior_knowledge()` - assumes server speaks HTTP/2 directly (no upgrade negotiation)
-- For HTTPS with ALPN, the tool will negotiate HTTP/2 automatically
-- Warns if responses come back as HTTP/1.1 instead of HTTP/2
+- HTTP/2 uses `http2_prior_knowledge()` - assumes server speaks HTTP/2 directly
+- HTTP/3 uses `http3_prior_knowledge()` - requires HTTPS and QUIC-capable server
+- Warns if responses come back using unexpected protocol version
 
 ## License
 
