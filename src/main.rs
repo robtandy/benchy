@@ -2,7 +2,7 @@ use clap::Parser;
 use colored::Colorize;
 use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::{Client, Version};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -34,6 +34,10 @@ struct Args {
     #[arg(short = 'k', long = "insecure")]
     insecure: bool,
 
+    /// Abort on first error and show details
+    #[arg(short = 'f', long = "fail-fast")]
+    fail_fast: bool,
+
     /// Target URL
     url: String,
 }
@@ -41,6 +45,14 @@ struct Args {
 struct Stats {
     success: AtomicU64,
     failed: AtomicU64,
+}
+
+#[derive(Debug)]
+struct ErrorDetails {
+    message: String,
+    status: Option<u16>,
+    headers: Option<String>,
+    body: Option<String>,
 }
 
 fn build_client(http3: bool, insecure: bool, is_https: bool) -> Result<Client, reqwest::Error> {
@@ -66,6 +78,12 @@ fn build_client(http3: bool, insecure: bool, is_https: bool) -> Result<Client, r
     builder.build()
 }
 
+enum RequestResult {
+    Success(Duration),
+    Failed(Duration),
+    Error(ErrorDetails),
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -78,7 +96,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         failed: AtomicU64::new(0),
     });
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<Duration>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<RequestResult>();
+    let abort_flag = Arc::new(AtomicBool::new(false));
 
     let is_https = args.url.starts_with("https://");
     let url: Arc<str> = args.url.into();
@@ -110,6 +129,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let stats = stats.clone();
         let tx = tx.clone();
         let pipeline = args.pipeline;
+        let abort_flag = abort_flag.clone();
+        let fail_fast = args.fail_fast;
 
         let my_reqs = reqs_per_worker + if (i as u64) < remainder { 1 } else { 0 };
 
@@ -117,16 +138,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut in_flight = FuturesUnordered::new();
             let mut sent = 0u64;
 
-            while sent < my_reqs && in_flight.len() < pipeline {
-                in_flight.push(send_request(&client, &url, &data, &stats, expected_version));
+            while sent < my_reqs && in_flight.len() < pipeline && !abort_flag.load(Ordering::Relaxed) {
+                in_flight.push(send_request(&client, &url, &data, &stats, expected_version, fail_fast));
                 sent += 1;
             }
 
-            while let Some(elapsed) = in_flight.next().await {
-                let _ = tx.send(elapsed);
+            while let Some(result) = in_flight.next().await {
+                if abort_flag.load(Ordering::Relaxed) {
+                    break;
+                }
 
-                if sent < my_reqs {
-                    in_flight.push(send_request(&client, &url, &data, &stats, expected_version));
+                let should_abort = matches!(&result, RequestResult::Error(_));
+                let _ = tx.send(result);
+
+                if should_abort {
+                    break;
+                }
+
+                if sent < my_reqs && !abort_flag.load(Ordering::Relaxed) {
+                    in_flight.push(send_request(&client, &url, &data, &stats, expected_version, fail_fast));
                     sent += 1;
                 }
             }
@@ -135,20 +165,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     drop(tx);
 
+    let abort_flag_collector = abort_flag.clone();
+    let fail_fast = args.fail_fast;
     let collector = tokio::spawn(async move {
         let mut latencies = Vec::with_capacity(args.requests as usize);
-        while let Some(d) = rx.recv().await {
-            latencies.push(d);
+        let mut first_error: Option<ErrorDetails> = None;
+
+        while let Some(result) = rx.recv().await {
+            match result {
+                RequestResult::Success(d) | RequestResult::Failed(d) => {
+                    latencies.push(d);
+                }
+                RequestResult::Error(details) => {
+                    if fail_fast && first_error.is_none() {
+                        first_error = Some(details);
+                        abort_flag_collector.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
         }
-        latencies
+        (latencies, first_error)
     });
 
     for h in handles {
         let _ = h.await;
     }
 
-    let mut latencies = collector.await?;
+    let (mut latencies, first_error) = collector.await?;
     let total_time = start.elapsed();
+
+    // Show error details if we aborted
+    if let Some(err) = first_error {
+        println!("\n{}", "--- Error Details ---".red().bold());
+        println!("{:<14} {}", "Error:".white(), err.message.red());
+        if let Some(status) = err.status {
+            println!("{:<14} {}", "Status:".white(), status.to_string().yellow());
+        }
+        if let Some(headers) = err.headers {
+            println!("\n{}:", "Headers".white().bold());
+            println!("{}", headers.dimmed());
+        }
+        if let Some(body) = err.body {
+            println!("\n{}:", "Body".white().bold());
+            println!("{}", body);
+        }
+        std::process::exit(1);
+    }
 
     let success = stats.success.load(Ordering::Relaxed);
     let failed = stats.failed.load(Ordering::Relaxed);
@@ -193,7 +255,8 @@ async fn send_request(
     data: &Option<Arc<str>>,
     stats: &Stats,
     expected_version: Version,
-) -> Duration {
+    fail_fast: bool,
+) -> RequestResult {
     let req_start = Instant::now();
 
     let result = if let Some(ref body) = data {
@@ -219,17 +282,43 @@ async fn send_request(
                     expected_version
                 );
             }
-            if resp.status().is_success() {
+
+            let status = resp.status();
+            if status.is_success() {
                 stats.success.fetch_add(1, Ordering::Relaxed);
+                let _ = resp.bytes().await;
+                RequestResult::Success(elapsed)
             } else {
                 stats.failed.fetch_add(1, Ordering::Relaxed);
+
+                if fail_fast {
+                    let headers = format!("{:#?}", resp.headers());
+                    let body = resp.text().await.ok();
+                    RequestResult::Error(ErrorDetails {
+                        message: format!("HTTP {} {}", status.as_u16(), status.canonical_reason().unwrap_or("")),
+                        status: Some(status.as_u16()),
+                        headers: Some(headers),
+                        body,
+                    })
+                } else {
+                    let _ = resp.bytes().await;
+                    RequestResult::Failed(elapsed)
+                }
             }
-            let _ = resp.bytes().await;
         }
-        Err(_) => {
+        Err(e) => {
             stats.failed.fetch_add(1, Ordering::Relaxed);
+
+            if fail_fast {
+                RequestResult::Error(ErrorDetails {
+                    message: e.to_string(),
+                    status: e.status().map(|s| s.as_u16()),
+                    headers: None,
+                    body: None,
+                })
+            } else {
+                RequestResult::Failed(elapsed)
+            }
         }
     }
-
-    elapsed
 }
