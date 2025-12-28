@@ -2,6 +2,7 @@ use clap::Parser;
 use colored::Colorize;
 use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::{Client, Version};
+use std::error::Error;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -64,15 +65,19 @@ fn build_client(http3: bool, insecure: bool, is_https: bool) -> Result<Client, r
         // HTTP/3 always uses QUIC (encrypted)
         builder = builder.http3_prior_knowledge();
     } else if is_https {
-        // HTTPS: use ALPN negotiation for HTTP/2
-        builder = builder.use_rustls_tls();
+        // HTTPS: prefer HTTP/2 via ALPN, enable adaptive window for better performance
+        builder = builder
+            .use_rustls_tls()
+            .http2_adaptive_window(true);
     } else {
         // Plain HTTP: use h2c (HTTP/2 over cleartext)
         builder = builder.http2_prior_knowledge();
     }
 
     if insecure {
-        builder = builder.danger_accept_invalid_certs(true);
+        builder = builder
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true);
     }
 
     builder.build()
@@ -310,8 +315,16 @@ async fn send_request(
             stats.failed.fetch_add(1, Ordering::Relaxed);
 
             if fail_fast {
+                // Build full error chain
+                let mut error_msg = e.to_string();
+                let mut source = e.source();
+                while let Some(src) = source {
+                    error_msg.push_str(&format!("\n  caused by: {}", src));
+                    source = src.source();
+                }
+
                 RequestResult::Error(ErrorDetails {
-                    message: e.to_string(),
+                    message: error_msg,
                     status: e.status().map(|s| s.as_u16()),
                     headers: None,
                     body: None,
