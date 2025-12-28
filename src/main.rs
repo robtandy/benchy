@@ -43,14 +43,19 @@ struct Stats {
     failed: AtomicU64,
 }
 
-fn build_client(http3: bool, insecure: bool) -> Result<Client, reqwest::Error> {
+fn build_client(http3: bool, insecure: bool, is_https: bool) -> Result<Client, reqwest::Error> {
     let mut builder = Client::builder()
         .pool_max_idle_per_host(1)
         .pool_idle_timeout(Duration::from_secs(30));
 
     if http3 {
+        // HTTP/3 always uses QUIC (encrypted)
         builder = builder.http3_prior_knowledge();
+    } else if is_https {
+        // HTTPS: use ALPN negotiation for HTTP/2
+        builder = builder.use_rustls_tls();
     } else {
+        // Plain HTTP: use h2c (HTTP/2 over cleartext)
         builder = builder.http2_prior_knowledge();
     }
 
@@ -75,6 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Duration>();
 
+    let is_https = args.url.starts_with("https://");
     let url: Arc<str> = args.url.into();
     let data: Option<Arc<str>> = args.data.map(|s| s.into());
 
@@ -97,7 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut handles = Vec::with_capacity(args.connections);
 
     for i in 0..args.connections {
-        let client = build_client(args.http3, args.insecure)?;
+        let client = build_client(args.http3, args.insecure, is_https)?;
 
         let url = url.clone();
         let data = data.clone();
